@@ -38,10 +38,11 @@ enum SampleSet: String, CaseIterable, Identifiable {
     }
 }
 enum Mode: String, CaseIterable, Identifiable {
-    case original = "Original", fg = "FG ×2", sr = "SR", both = "FG + SR"
+    case original = "Original", fg = "FG ×2", sr = "SR", both = "FG + SR", tiled = "Tiled SR", tiledFG = "FG + Tiled"
     var id: String { rawValue }
-    var fg: Bool { self == .fg || self == .both }
-    var sr: Bool { self == .sr || self == .both }
+    var fg: Bool { self == .fg || self == .both || self == .tiledFG }
+    var sr: Bool { self == .sr || self == .both || tiledSR }
+    var tiledSR: Bool { self == .tiled || self == .tiledFG }
 }
 enum SRColorMode: String, CaseIterable, Identifiable {
     case raw = "Raw SR", chroma = "Keep CbCr", detail = "Keep color + tone"
@@ -242,6 +243,137 @@ final class Effect {
     }
 }
 
+// A tile is a native-size crop, not a resized copy of the full frame.
+// Use overlapping crops and keep the middle of each overlap as the seam.
+// All coordinates are even so the NV12 chroma planes remain aligned.
+struct TileAxis {
+    let start: Int
+    let low: Int
+    let high: Int
+    static func make(length: Int, tile: Int) -> [TileAxis] {
+        guard tile > 32, tile <= length, length % 2 == 0, tile % 2 == 0 else { return [] }
+        if tile == length { return [TileAxis(start:0,low:0,high:length)] }
+        let gap = length - tile
+        let steps = (gap + tile - 33) / (tile - 32)
+        let starts = (0...steps).map { i in ((i * gap / steps) / 2) * 2 }
+        let cuts = (0..<steps).map { i in ((starts[i] + tile + starts[i+1]) / 4) * 2 }
+        return (0...steps).map { i in
+            TileAxis(start:starts[i],low:i == 0 ? 0 : cuts[i-1],high:i == steps ? length : cuts[i])
+        }
+    }
+}
+func nv12(_ b: CVPixelBuffer) -> Bool {
+    let f = CVPixelBufferGetPixelFormatType(b)
+    return CVPixelBufferGetPlaneCount(b) == 2 &&
+        (f == kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange ||
+         f == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange)
+}
+func fullFrameAttributes(width: Int, height: Int, format: OSType) -> [String: any Sendable] {
+    [kCVPixelBufferWidthKey as String:width,
+     kCVPixelBufferHeightKey as String:height,
+     kCVPixelBufferPixelFormatTypeKey as String:format,
+     kCVPixelBufferIOSurfacePropertiesKey as String:[:] as [String:Int]]
+}
+func copyNV12(_ src: CVPixelBuffer, _ dst: CVPixelBuffer,
+              sx: Int, sy: Int, dx: Int, dy: Int, w: Int, h: Int) throws {
+    guard nv12(src), nv12(dst), CVPixelBufferGetPixelFormatType(src) == CVPixelBufferGetPixelFormatType(dst),
+          [sx,sy,dx,dy,w,h].allSatisfy({ $0 >= 0 && $0 % 2 == 0 }), w > 0, h > 0,
+          sx+w <= CVPixelBufferGetWidth(src), sy+h <= CVPixelBufferGetHeight(src),
+          dx+w <= CVPixelBufferGetWidth(dst), dy+h <= CVPixelBufferGetHeight(dst) else {
+        throw LabError("NV12 tile copy: invalid format or rectangle")
+    }
+    guard CVPixelBufferLockBaseAddress(src,.readOnly) == kCVReturnSuccess else { throw LabError("Tile source lock failed") }
+    defer { CVPixelBufferUnlockBaseAddress(src,.readOnly) }
+    guard CVPixelBufferLockBaseAddress(dst,[]) == kCVReturnSuccess else { throw LabError("Tile destination lock failed") }
+    defer { CVPixelBufferUnlockBaseAddress(dst,[]) }
+    for plane in 0..<2 {
+        guard let a = CVPixelBufferGetBaseAddressOfPlane(src,plane),
+              let b = CVPixelBufferGetBaseAddressOfPlane(dst,plane) else { throw LabError("Tile plane unavailable") }
+        let asr = CVPixelBufferGetBytesPerRowOfPlane(src,plane)
+        let bsr = CVPixelBufferGetBytesPerRowOfPlane(dst,plane)
+        let divisor = plane == 0 ? 1 : 2
+        // NV12 chroma uses two interleaved bytes per 2x2 luma block.
+        // Horizontal byte offsets equal even luma coordinates in both planes.
+        for row in 0..<(h/divisor) {
+            memcpy(b.advanced(by:(dy/divisor+row)*bsr+dx),
+                   a.advanced(by:(sy/divisor+row)*asr+sx),w)
+        }
+    }
+}
+final class TiledSR {
+    let width: Int, height: Int, tileWidth: Int, tileHeight: Int
+    let xs: [TileAxis], ys: [TileAxis]
+    let effect: Effect
+    var summary: String { "\(xs.count)×\(ys.count) tiles · \(tileWidth)×\(tileHeight) each · overlap cropped" }
+    init(width: Int, height: Int) throws {
+        guard width % 2 == 0, height % 2 == 0,
+              VTLowLatencySuperResolutionScalerConfiguration.isSupported else {
+            throw LabError("Tiled SR requires even dimensions and native SR support")
+        }
+        // Prefer a supported 2×2 arrangement with at least 32px overlap.
+        // If larger tile shapes are rejected, fall back to proven 640×360 / 854×480 shapes.
+        let candidates = [(width,height),(854,480),(800,448),(768,432),(720,416),(704,400),(672,384),(640,480),(640,400),(640,360),(480,360),(426,240),(320,240)]
+        var choices: [(w:Int,h:Int,x:[TileAxis],y:[TileAxis])] = []
+        for (w,h) in candidates {
+            guard w <= width, h <= height else { continue }
+            let x = TileAxis.make(length:width,tile:w), y = TileAxis.make(length:height,tile:h)
+            guard !x.isEmpty, !y.isEmpty, x.count*y.count <= 12,
+                  VTLowLatencySuperResolutionScalerConfiguration.supportedScaleFactors(frameWidth:w,frameHeight:h).contains(2) else { continue }
+            choices.append((w,h,x,y))
+        }
+        choices.sort {
+            let a = $0.x.count*$0.y.count, b = $1.x.count*$1.y.count
+            if a != b { return a < b }
+            return $0.w*$0.h < $1.w*$1.h
+        }
+        // A reported supported scale is not a guarantee that startSession succeeds.
+        var selected: (w:Int,h:Int,x:[TileAxis],y:[TileAxis],e:Effect)?
+        var lastError = "no supported tile size"
+        for c in choices {
+            do {
+                let config = VTLowLatencySuperResolutionScalerConfiguration(frameWidth:c.w,frameHeight:c.h,scaleFactor:2)
+                let e = try Effect(config,input:config.sourcePixelBufferAttributes,output:config.destinationPixelBufferAttributes)
+                selected = (c.w,c.h,c.x,c.y,e)
+                break
+            } catch { lastError = error.localizedDescription }
+        }
+        guard let c = selected else { throw LabError("Tiled SR: \(lastError)") }
+        self.width=width; self.height=height; tileWidth=c.w; tileHeight=c.h
+        xs=c.x; ys=c.y; effect=c.e
+    }
+    func upscale(_ source: CVPixelBuffer, _ t: CMTime) async throws -> CVPixelBuffer {
+        guard nv12(source), CVPixelBufferGetWidth(source)==width, CVPixelBufferGetHeight(source)==height else {
+            throw LabError("Tiled SR requires matching 8-bit NV12 input")
+        }
+        var output: CVPixelBuffer?
+        for y in ys {
+            for x in xs {
+                try Task.checkCancellation()
+                let tile = try makeBuffer(effect.inputAttrs)
+                guard CVPixelBufferGetWidth(tile)==tileWidth, CVPixelBufferGetHeight(tile)==tileHeight else {
+                    throw LabError("Unexpected tile input size")
+                }
+                try copyNV12(source,tile,sx:x.start,sy:y.start,dx:0,dy:0,w:tileWidth,h:tileHeight)
+                inheritColor(source,tile)
+                let raw = try await effect.upscale(tile,t)
+                guard nv12(raw), CVPixelBufferGetWidth(raw)==tileWidth*2, CVPixelBufferGetHeight(raw)==tileHeight*2 else {
+                    throw LabError("Unexpected tile output format or scale")
+                }
+                if output == nil {
+                    let attrs = fullFrameAttributes(width:width*2,height:height*2,format:CVPixelBufferGetPixelFormatType(raw))
+                    output = try makeBuffer(attrs)
+                    inheritColor(raw,output!)
+                }
+                guard let dst = output else { throw LabError("Tile assembly allocation failed") }
+                try copyNV12(raw,dst,sx:(x.low-x.start)*2,sy:(y.low-y.start)*2,
+                             dx:x.low*2,dy:y.low*2,w:(x.high-x.low)*2,h:(y.high-y.low)*2)
+            }
+        }
+        guard let output else { throw LabError("No tiles rendered") }
+        return output
+    }
+}
+
 final class Surface: UIView {
     override class var layerClass: AnyClass { AVSampleBufferDisplayLayer.self }
     var videoLayer: AVSampleBufferDisplayLayer { layer as! AVSampleBufferDisplayLayer }
@@ -319,13 +451,17 @@ struct VideoSurface: UIViewRepresentable {
         let fps = try await track.load(.nominalFrameRate)
         guard w > 0, h > 0, w <= 1280, h <= 720 else { throw LabError("Lab input limited to landscape 1280×720") }
         var fg: Effect?, sr: Effect?
+        var tiled: TiledSR?
         var scale: Float = 1
         if mode.fg {
             guard VTLowLatencyFrameInterpolationConfiguration.isSupported,
                   let c = VTLowLatencyFrameInterpolationConfiguration(frameWidth:w,frameHeight:h,numberOfInterpolatedFrames:1) else { throw LabError("FG unsupported at \(w)×\(h)") }
             fg = try Effect(c,input:c.sourcePixelBufferAttributes,output:c.destinationPixelBufferAttributes)
         }
-        if mode.sr {
+        if mode.tiledSR {
+            tiled = try TiledSR(width:w,height:h)
+            scale = 2
+        } else if mode.sr {
             guard VTLowLatencySuperResolutionScalerConfiguration.isSupported else { throw LabError("SR unsupported on device") }
             let factors = VTLowLatencySuperResolutionScalerConfiguration.supportedScaleFactors(frameWidth:w,frameHeight:h)
             guard !factors.isEmpty else { throw LabError("Hardware reports no SR scale for \(w)×\(h)") }
@@ -338,7 +474,7 @@ struct VideoSurface: UIViewRepresentable {
             sr = try Effect(c,input:c.sourcePixelBufferAttributes,output:c.destinationPixelBufferAttributes)
         }
         let reader = try AVAssetReader(asset:asset)
-        let attrs = fg?.inputAttrs ?? sr?.inputAttrs
+        let attrs = fg?.inputAttrs ?? sr?.inputAttrs ?? tiled?.effect.inputAttrs
         let requested = attrs?[kCVPixelBufferPixelFormatTypeKey as String]
         let format: OSType
         if let n = requested as? NSNumber { format = n.uint32Value }
@@ -351,6 +487,7 @@ struct VideoSurface: UIViewRepresentable {
         guard reader.startReading() else { throw reader.error ?? LabError("Reader start failed") }
         defer { reader.cancelReading() }
         status = "\(w)×\(h) @ \(fps) → \(Int(Float(w)*scale))×\(Int(Float(h)*scale)) · \(mode.rawValue)"
+        if let tiled { status += "\n\(tiled.summary)" }
         var prev: (CVPixelBuffer,CMTime)?
         var origin: CMTime?
         var start = CACurrentMediaTime()
@@ -363,7 +500,14 @@ struct VideoSurface: UIViewRepresentable {
             try Task.checkCancellation()
             let begin = CACurrentMediaTime()
             let result: CVPixelBuffer
-            if let sr {
+            if let tiled {
+                let raw = try await tiled.upscale(b,t)
+                let attrs = fullFrameAttributes(width:CVPixelBufferGetWidth(raw),height:CVPixelBufferGetHeight(raw),format:CVPixelBufferGetPixelFormatType(raw))
+                result = try correctSR(b,raw,colorMode,attrs)
+                if colorDiagnostics.isEmpty {
+                    colorDiagnostics = "\(tiled.summary)\nInput: \(planeMeans(b))\nRaw tiled SR: \(planeMeans(raw))\nOutput: \(planeMeans(result))\n\(colorMode.rawValue)\nRendered: \(colorInfo(result))\nActual buffer: \(CVPixelBufferGetWidth(result))×\(CVPixelBufferGetHeight(result))"
+                }
+            } else if let sr {
                 let raw = try await sr.upscale(b,t)
                 result = try correctSR(b,raw,colorMode,sr.attrs)
                 if colorDiagnostics.isEmpty {
@@ -571,7 +715,10 @@ struct VideoSurface: UIViewRepresentable {
     private var settingsPanel: some View {
         ScrollView {
             VStack(alignment:.leading,spacing:14) {
-                Picker("Mode",selection:$lab.mode) { ForEach(Mode.allCases) { Text($0.rawValue).tag($0) } }.pickerStyle(.segmented).disabled(lab.running)
+                Picker("Mode",selection:$lab.mode) { ForEach(Mode.allCases) { Text($0.rawValue).tag($0) } }.pickerStyle(.menu).disabled(lab.running)
+                if lab.mode.tiledSR {
+                    Text("Experimental 2× SR on overlapping tiles. May be slower than realtime or show seams. Try Tiled SR before FG + Tiled.").font(.caption).foregroundStyle(.secondary)
+                }
                 if lab.mode.sr {
                     Picker("SR color",selection:$lab.srColorMode) {
                         ForEach(SRColorMode.allCases) { Text($0.rawValue).tag($0) }

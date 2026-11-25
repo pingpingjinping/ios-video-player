@@ -15,6 +15,10 @@ Open Actions → Build IPA → successful run → VTPlayer-IPA artifact. Extract
 
 Choose a sample and a mode, press Play. Stop before switching mode. Start with Original, then FG, SR, and FG + SR at each resolution. An unsupported configuration or processing failure is reported explicitly. Submitted FPS does not measure physical display refresh. Late frames are counted, not skipped; overloaded playback can lag. This prototype is silent, lacks seeking and subtitles, and does not handle HDR or rotated video.
 
+## Experimental tiled SR
+
+Select **Tiled SR** to try native VideoToolbox SR on 720p even when a full-frame 2× configuration is not supported. The app searches supported even-sized crops, preferring fewer tiles, and processes overlapping NV12 tiles sequentially with one native SR session. Each tile is a crop at original pixel density; the assembled output is 2× the original (1280×720 → 2560×1440), then displayed aspect-fit. Overlap edges are discarded at their midpoints; this reduces but does not eliminate seam risk. Color/tone correction is applied after assembly, not separately on each tile. The normal SR mode is unchanged. **FG + Tiled** is an optional heavier test. Exact tile grid and output dimensions are reported in diagnostics. Native support for each tile, session startup, speed, thermal load, and seam visibility remain device-dependent. The 720p input limit remains in place.
+
 ## Low-bitrate and zoom comparison
 
 For any animation collection, choose **Low bitrate** for 240p, 360p or 480p tiers. These are derived from the same bundled 720p-tier excerpt, downscaled with bilinear sampling and encoded with H.264 CRF 34 and VBV peak-rate targets of 100, 180 and 300 kb/s respectively. Actual average bitrate may be lower. The original Clean clips are retained. Ultrawide clips fit within the tier bounds without padding. The derivative clips retain the same Creative Commons licenses and credits listed below.
