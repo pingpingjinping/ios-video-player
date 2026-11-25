@@ -1,4 +1,5 @@
 import SwiftUI
+import UIKit
 import AVFoundation
 import VideoToolbox
 import CoreMedia
@@ -79,7 +80,7 @@ struct VideoSurface: UIViewRepresentable {
     @Published var stats = ""
     @Published var running = false
     @Published var file: URL?
-    let surface = Surface()
+    let surface = Surface(frame: .zero)
     private var job: Task<Void,Never>?
     var capabilities: String {
         let fg = VTLowLatencyFrameInterpolationConfiguration.isSupported
@@ -90,9 +91,10 @@ struct VideoSurface: UIViewRepresentable {
         }
         return (["FG: \(fg ? "supported" : "unsupported") · SR: \(sr ? "supported" : "unsupported")"] + sizes).joined(separator:"\n")
     }
-    func choose(_ height: Int) {
-        file = Bundle.main.url(forResource:"test-\(height)p",withExtension:"mp4")
-        status = file == nil ? "Sample missing" : "Selected \(height)p / 24fps"
+    func choose(_ height: Int) { chooseSample("\(height)p") }
+    func chooseSample(_ name: String) {
+        file = Bundle.main.url(forResource:"test-\(name)",withExtension:"mp4")
+        status = file == nil ? "Sample missing" : "Selected \(name) / 24fps"
     }
     func stop() { job?.cancel(); status = "Stopping…" }
     func start() {
@@ -101,6 +103,7 @@ struct VideoSurface: UIViewRepresentable {
         running = true; stats = ""; status = "Starting \(selected.rawValue)…"
         surface.videoLayer.flushAndRemoveImage()
         surface.videoLayer.videoGravity = .resizeAspect
+        surface.backgroundColor = .black
         job = Task {
             do { try await play(file, selected); status = "Finished" }
             catch is CancellationError { status = "Stopped" }
@@ -204,7 +207,7 @@ struct VideoSurface: UIViewRepresentable {
 @main struct VTPlayerApp: App {
     var body: some Scene { WindowGroup { ContentView() } }
 }
-struct ContentView: View {
+@MainActor struct ContentView: View {
     @StateObject private var lab = Lab()
     @State private var importer = false
     var body: some View {
@@ -214,6 +217,7 @@ struct ContentView: View {
                 VideoSurface(surface:lab.surface).aspectRatio(16/9,contentMode:.fit).background(.black)
                 Picker("Mode",selection:$lab.mode) { ForEach(Mode.allCases) { Text($0.rawValue).tag($0) } }.pickerStyle(.segmented).disabled(lab.running)
                 HStack { ForEach([360,480,720],id:\.self) { h in Button("\(h)p") { lab.choose(h) }.buttonStyle(.bordered) }; Button("File") { importer=true }.buttonStyle(.bordered) }.disabled(lab.running)
+                HStack { Button("4:3 sample") { lab.chooseSample("4x3") }; Button("21:9 sample") { lab.chooseSample("21x9") } }.buttonStyle(.bordered).disabled(lab.running)
                 HStack { Button("Play") { lab.start() }.buttonStyle(.borderedProminent).disabled(lab.running || lab.file == nil); Button("Stop") { lab.stop() }.buttonStyle(.bordered).disabled(!lab.running) }
                 Text(lab.file?.lastPathComponent ?? "No file").font(.caption)
                 Text(lab.status).font(.headline).textSelection(.enabled)
