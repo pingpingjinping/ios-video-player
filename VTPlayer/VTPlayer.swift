@@ -9,6 +9,34 @@ import Combine
 import Accelerate
 import UniformTypeIdentifiers
 
+enum SampleSet: String, CaseIterable, Identifiable {
+    case pattern = "Test pattern", morevna = "Morevna", hero = "HERO", pepper = "Pepper & Carrot"
+    var id: String { rawValue }
+    var prefix: String {
+        switch self {
+        case .pattern: return "test"
+        case .morevna: return "morevna"
+        case .hero: return "hero"
+        case .pepper: return "pepper"
+        }
+    }
+    var credit: String {
+        switch self {
+        case .pattern: return "FFmpeg test pattern"
+        case .morevna: return "Morevna Episode 3.0.2 — Morevna Project · CC BY-SA 4.0"
+        case .hero: return "HERO — Blender Foundation · CC BY 4.0"
+        case .pepper: return "Pepper & Carrot Ep. 6 — Morevna Project / David Revoy · CC BY-SA 4.0"
+        }
+    }
+    var source: URL? {
+        switch self {
+        case .pattern: return nil
+        case .morevna: return URL(string:"https://commons.wikimedia.org/wiki/File:Morevna_Episode_3.0.2_(English).webm")
+        case .hero: return URL(string:"https://commons.wikimedia.org/wiki/File:HERO_-_Blender_Open_Movie-full_movie.webm")
+        case .pepper: return URL(string:"https://commons.wikimedia.org/wiki/File:Morevna_Project_-_Pepper%26Carrot_(animated_comic)_-_Episode_6_-_The_Potion_Contest_(Russian_variant).webm")
+        }
+    }
+}
 enum Mode: String, CaseIterable, Identifiable {
     case original = "Original", fg = "FG ×2", sr = "SR", both = "FG + SR"
     var id: String { rawValue }
@@ -232,6 +260,9 @@ struct VideoSurface: UIViewRepresentable {
     @Published var colorDiagnostics = ""
     @Published var running = false
     @Published var file: URL?
+    @Published var sampleSet = SampleSet.pattern
+    @Published var sampleHeight = 480
+    func refreshSample() { choose(sampleHeight) }
     let surface = Surface(frame: .zero)
     private var job: Task<Void,Never>?
     var capabilities: String {
@@ -243,7 +274,11 @@ struct VideoSurface: UIViewRepresentable {
         }
         return (["FG: \(fg ? "supported" : "unsupported") · SR: \(sr ? "supported" : "unsupported")"] + sizes).joined(separator:"\n")
     }
-    func choose(_ height: Int) { chooseSample("\(height)p") }
+    func choose(_ height: Int) {
+        sampleHeight = height
+        file = Bundle.main.url(forResource:"\(sampleSet.prefix)-\(height)p",withExtension:"mp4")
+        status = file == nil ? "Sample missing" : "Selected \(sampleSet.rawValue) · \(height)p tier / 24fps"
+    }
     func chooseSample(_ name: String) {
         file = Bundle.main.url(forResource:"test-\(name)",withExtension:"mp4")
         status = file == nil ? "Sample missing" : "Selected \(name) / 24fps"
@@ -312,7 +347,7 @@ struct VideoSurface: UIViewRepresentable {
         var total = 0, shown = 0, late = 0, generated = 0
         var work: Double = 0
         var lastStats = start
-        let synthetic = url.deletingLastPathComponent().standardizedFileURL == Bundle.main.bundleURL.standardizedFileURL
+        let synthetic = url.lastPathComponent.hasPrefix("test-") && url.deletingLastPathComponent().standardizedFileURL == Bundle.main.bundleURL.standardizedFileURL
         var inputColor: String?
         func emit(_ b: CVPixelBuffer,_ t: CMTime) async throws {
             try Task.checkCancellation()
@@ -391,8 +426,20 @@ struct VideoSurface: UIViewRepresentable {
                         ForEach(SRColorMode.allCases) { Text($0.rawValue).tag($0) }
                     }.pickerStyle(.menu).disabled(lab.running)
                 }
+                Picker("Sample collection",selection:$lab.sampleSet) {
+                    ForEach(SampleSet.allCases) { Text($0.rawValue).tag($0) }
+                }.pickerStyle(.menu).disabled(lab.running)
+                    .onChange(of:lab.sampleSet) { _,_ in lab.refreshSample() }
                 HStack { ForEach([360,480,720],id:\.self) { h in Button("\(h)p") { lab.choose(h) }.buttonStyle(.bordered) }; Button("File") { importer=true }.buttonStyle(.bordered) }.disabled(lab.running)
-                HStack { Button("4:3 sample") { lab.chooseSample("4x3") }; Button("21:9 sample") { lab.chooseSample("21x9") } }.buttonStyle(.bordered).disabled(lab.running)
+                if lab.sampleSet == .pattern {
+                    HStack { Button("4:3 sample") { lab.chooseSample("4x3") }; Button("21:9 sample") { lab.chooseSample("21x9") } }.buttonStyle(.bordered).disabled(lab.running)
+                } else {
+                    Text(lab.sampleSet.credit).font(.caption)
+                    Text("Muted, excerpted, resized and encoded at 24fps. Widescreen clips fit inside the selected tier without stretching.").font(.caption).foregroundStyle(.secondary)
+                    if let source = lab.sampleSet.source { Link("Source and license",destination:source).font(.caption) }
+                    Link("CC BY 4.0",destination:URL(string:"https://creativecommons.org/licenses/by/4.0/")!).font(.caption)
+                    Link("CC BY-SA 4.0",destination:URL(string:"https://creativecommons.org/licenses/by-sa/4.0/")!).font(.caption)
+                }
                 HStack { Button("Play") { lab.start() }.buttonStyle(.borderedProminent).disabled(lab.running || lab.file == nil); Button("Stop") { lab.stop() }.buttonStyle(.bordered).disabled(!lab.running) }
                 Text(lab.file?.lastPathComponent ?? "No file").font(.caption)
                 Text(lab.status).font(.headline).textSelection(.enabled)
