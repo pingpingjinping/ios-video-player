@@ -6,6 +6,7 @@ import CoreMedia
 import CoreVideo
 import QuartzCore
 import Combine
+import Accelerate
 import UniformTypeIdentifiers
 
 enum Mode: String, CaseIterable, Identifiable {
@@ -13,6 +14,10 @@ enum Mode: String, CaseIterable, Identifiable {
     var id: String { rawValue }
     var fg: Bool { self == .fg || self == .both }
     var sr: Bool { self == .sr || self == .both }
+}
+enum SRColorMode: String, CaseIterable, Identifiable {
+    case raw = "Raw SR", chroma = "Keep CbCr", detail = "Keep color + tone"
+    var id: String { rawValue }
 }
 struct LabError: LocalizedError {
     let message: String
@@ -63,6 +68,115 @@ func tagSyntheticSample(_ b: CVPixelBuffer) {
         CVBufferSetAttachment(b, kCVImageBufferTransferFunctionKey, kCVImageBufferTransferFunction_ITU_R_709_2, .shouldPropagate)
     }
 }
+// Diagnose actual pixel values on a sparse uniform grid, before display conversion.
+func planeMeans(_ b: CVPixelBuffer) -> String {
+    guard CVPixelBufferGetPlaneCount(b) == 2,
+          [kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
+           kCVPixelFormatType_420YpCbCr8BiPlanarFullRange].contains(CVPixelBufferGetPixelFormatType(b)),
+          CVPixelBufferLockBaseAddress(b, .readOnly) == kCVReturnSuccess else { return "n/a" }
+    defer { CVPixelBufferUnlockBaseAddress(b, .readOnly) }
+    var sums = [Double](repeating: 0, count: 3)
+    for p in 0..<2 {
+        guard let base = CVPixelBufferGetBaseAddressOfPlane(b,p) else { return "n/a" }
+        let w = CVPixelBufferGetWidthOfPlane(b,p), h = CVPixelBufferGetHeightOfPlane(b,p)
+        let stride = CVPixelBufferGetBytesPerRowOfPlane(b,p)
+        let ptr = base.assumingMemoryBound(to: UInt8.self)
+        for iy in 0..<32 {
+            let y = min(h-1,(2*iy+1)*h/64)
+            for ix in 0..<32 {
+                let x = min(w-1,(2*ix+1)*w/64)
+                if p == 0 { sums[0] += Double(ptr[y*stride+x]) }
+                else {
+                    sums[1] += Double(ptr[y*stride+2*x])
+                    sums[2] += Double(ptr[y*stride+2*x+1])
+                }
+            }
+        }
+    }
+    return String(format:"Y %.1f / Cb %.1f / Cr %.1f",sums[0]/1024,sums[1]/1024,sums[2]/1024)
+}
+// 8-bit NV12 only: keep original chroma, optionally retain original low-frequency
+// luma and add just the SR model's high-frequency luma residual.
+func correctSR(_ source: CVPixelBuffer, _ raw: CVPixelBuffer, _ mode: SRColorMode,
+               _ attrs: [String: any Sendable]) throws -> CVPixelBuffer {
+    if mode == .raw { return raw }
+    let format = CVPixelBufferGetPixelFormatType(source)
+    guard format == CVPixelBufferGetPixelFormatType(raw),
+          [kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
+           kCVPixelFormatType_420YpCbCr8BiPlanarFullRange].contains(format),
+          CVPixelBufferGetPlaneCount(source) == 2, CVPixelBufferGetPlaneCount(raw) == 2 else {
+        throw LabError("Color-preserving SR requires matching 8-bit NV12 formats; try Raw SR")
+    }
+    let out = try makeBuffer(attrs)
+    guard CVPixelBufferGetPixelFormatType(out) == format,
+          CVPixelBufferGetPlaneCount(out) == 2,
+          CVPixelBufferGetWidth(out) == CVPixelBufferGetWidth(raw),
+          CVPixelBufferGetHeight(out) == CVPixelBufferGetHeight(raw) else {
+        throw LabError("Color correction output format mismatch")
+    }
+    guard CVPixelBufferLockBaseAddress(source,.readOnly) == kCVReturnSuccess else { throw LabError("Source lock failed") }
+    defer { CVPixelBufferUnlockBaseAddress(source,.readOnly) }
+    guard CVPixelBufferLockBaseAddress(raw,.readOnly) == kCVReturnSuccess else { throw LabError("SR lock failed") }
+    defer { CVPixelBufferUnlockBaseAddress(raw,.readOnly) }
+    guard CVPixelBufferLockBaseAddress(out,[]) == kCVReturnSuccess else { throw LabError("Output lock failed") }
+    defer { CVPixelBufferUnlockBaseAddress(out,[]) }
+    func plane(_ b: CVPixelBuffer,_ p: Int) throws -> vImage_Buffer {
+        guard let address = CVPixelBufferGetBaseAddressOfPlane(b,p) else { throw LabError("Plane unavailable") }
+        return vImage_Buffer(data:address,height:vImagePixelCount(CVPixelBufferGetHeightOfPlane(b,p)),
+                             width:vImagePixelCount(CVPixelBufferGetWidthOfPlane(b,p)),
+                             rowBytes:CVPixelBufferGetBytesPerRowOfPlane(b,p))
+    }
+    func check(_ result: vImage_Error) throws {
+        if result != kvImageNoError { throw LabError("Color scaler: \(result)") }
+    }
+    let flags = vImage_Flags(kvImageNoFlags)
+    var srcUV = try plane(source,1), dstUV = try plane(out,1)
+    try check(vImageScale_CbCr8(&srcUV,&dstUV,nil,flags))
+    var srcY = try plane(source,0), rawY = try plane(raw,0), dstY = try plane(out,0)
+    let sw = Int(srcY.width), sh = Int(srcY.height), dw = Int(dstY.width), dh = Int(dstY.height)
+    if mode == .chroma {
+        for y in 0..<dh {
+            memcpy(dstY.data.advanced(by:y*dstY.rowBytes),rawY.data.advanced(by:y*rawY.rowBytes),dw)
+        }
+    } else {
+        // base = conventional scale of original luma; low = up(down(raw SR luma)).
+        // Output = base + raw SR - low. Flat regions retain original tone.
+        try check(vImageScale_Planar8(&srcY,&dstY,nil,flags))
+        var down = [UInt8](repeating:0,count:sw*sh)
+        var low = [UInt8](repeating:0,count:dw*dh)
+        try down.withUnsafeMutableBytes { (downBytes: UnsafeMutableRawBufferPointer) in
+            var small = vImage_Buffer(data:downBytes.baseAddress!,height:vImagePixelCount(sh),width:vImagePixelCount(sw),rowBytes:sw)
+            try check(vImageScale_Planar8(&rawY,&small,nil,flags))
+            try low.withUnsafeMutableBytes { (lowBytes: UnsafeMutableRawBufferPointer) in
+                var smooth = vImage_Buffer(data:lowBytes.baseAddress!,height:vImagePixelCount(dh),width:vImagePixelCount(dw),rowBytes:dw)
+                try check(vImageScale_Planar8(&small,&smooth,nil,flags))
+                let lo = lowBytes.baseAddress!.assumingMemoryBound(to:UInt8.self)
+                let minY = format == kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange ? 16 : 0
+                let maxY = format == kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange ? 235 : 255
+                for y in 0..<dh {
+                    let dst = dstY.data.advanced(by:y*dstY.rowBytes).assumingMemoryBound(to:UInt8.self)
+                    let ai = rawY.data.advanced(by:y*rawY.rowBytes).assumingMemoryBound(to:UInt8.self)
+                    for x in 0..<dw {
+                        let value = Int(dst[x]) + Int(ai[x]) - Int(lo[y*dw+x])
+                        dst[x] = UInt8(clamping:min(maxY,max(minY,value)))
+                    }
+                }
+            }
+        }
+    }
+    for key in colorKeys {
+        if let value = CVBufferCopyAttachment(source,key,nil) {
+            CVBufferSetAttachment(out,key,value,.shouldPropagate)
+        }
+    }
+    if let value = CVBufferCopyAttachment(source,kCVImageBufferChromaLocationTopFieldKey,nil) {
+        CVBufferSetAttachment(out,kCVImageBufferChromaLocationTopFieldKey,value,.shouldPropagate)
+    }
+    if let value = CVBufferCopyAttachment(source,kCVImageBufferChromaLocationBottomFieldKey,nil) {
+        CVBufferSetAttachment(out,kCVImageBufferChromaLocationBottomFieldKey,value,.shouldPropagate)
+    }
+    return out
+}
 final class Effect {
     let processor = VTFrameProcessor()
     let attrs: [String: any Sendable]
@@ -112,6 +226,7 @@ struct VideoSurface: UIViewRepresentable {
 
 @MainActor final class Lab: ObservableObject {
     @Published var mode = Mode.original
+    @Published var srColorMode = SRColorMode.detail
     @Published var status = "Select a sample or local file."
     @Published var stats = ""
     @Published var colorDiagnostics = ""
@@ -137,18 +252,19 @@ struct VideoSurface: UIViewRepresentable {
     func start() {
         guard let file, !running else { return }
         let selected = mode
+        let selectedColor = srColorMode
         running = true; stats = ""; colorDiagnostics = ""; status = "Starting \(selected.rawValue)…"
         surface.videoLayer.flushAndRemoveImage()
         surface.videoLayer.videoGravity = .resizeAspect
         surface.backgroundColor = .black
         job = Task {
-            do { try await play(file, selected); status += " · Finished" }
+            do { try await play(file, selected, selectedColor); status += " · Finished" }
             catch is CancellationError { status = "Stopped" }
             catch { status = "Error: \(error.localizedDescription)" }
             running = false; job = nil
         }
     }
-    private func play(_ url: URL, _ mode: Mode) async throws {
+    private func play(_ url: URL, _ mode: Mode, _ colorMode: SRColorMode) async throws {
         let access = url.startAccessingSecurityScopedResource()
         defer { if access { url.stopAccessingSecurityScopedResource() } }
         let asset = AVURLAsset(url: url)
@@ -202,7 +318,13 @@ struct VideoSurface: UIViewRepresentable {
             try Task.checkCancellation()
             let begin = CACurrentMediaTime()
             let result: CVPixelBuffer
-            if let sr { result = try await sr.upscale(b,t) } else { result = b }
+            if let sr {
+                let raw = try await sr.upscale(b,t)
+                result = try correctSR(b,raw,colorMode,sr.attrs)
+                if colorDiagnostics.isEmpty {
+                    colorDiagnostics = "Input: \(planeMeans(b))\nRaw SR: \(planeMeans(raw))\nOutput: \(planeMeans(result))\n\(colorMode.rawValue)\nDecoded: \(inputColor ?? colorInfo(b))\nRendered: \(colorInfo(result))\nActual buffer: \(CVPixelBufferGetWidth(result))×\(CVPixelBufferGetHeight(result))"
+                }
+            } else { result = b }
             work += CACurrentMediaTime()-begin
             if colorDiagnostics.isEmpty {
                 colorDiagnostics = "Decoded: \(inputColor ?? colorInfo(b))\nRendered: \(colorInfo(result))\nActual buffer: \(CVPixelBufferGetWidth(result))×\(CVPixelBufferGetHeight(result))"
@@ -264,6 +386,11 @@ struct VideoSurface: UIViewRepresentable {
                 Text("VTPlayer Lab").font(.largeTitle.bold())
                 VideoSurface(surface:lab.surface).aspectRatio(16/9,contentMode:.fit).background(.black)
                 Picker("Mode",selection:$lab.mode) { ForEach(Mode.allCases) { Text($0.rawValue).tag($0) } }.pickerStyle(.segmented).disabled(lab.running)
+                if lab.mode.sr {
+                    Picker("SR color",selection:$lab.srColorMode) {
+                        ForEach(SRColorMode.allCases) { Text($0.rawValue).tag($0) }
+                    }.pickerStyle(.menu).disabled(lab.running)
+                }
                 HStack { ForEach([360,480,720],id:\.self) { h in Button("\(h)p") { lab.choose(h) }.buttonStyle(.bordered) }; Button("File") { importer=true }.buttonStyle(.bordered) }.disabled(lab.running)
                 HStack { Button("4:3 sample") { lab.chooseSample("4x3") }; Button("21:9 sample") { lab.chooseSample("21x9") } }.buttonStyle(.bordered).disabled(lab.running)
                 HStack { Button("Play") { lab.start() }.buttonStyle(.borderedProminent).disabled(lab.running || lab.file == nil); Button("Stop") { lab.stop() }.buttonStyle(.bordered).disabled(!lab.running) }
