@@ -266,13 +266,18 @@ struct VideoSurface: UIViewRepresentable {
     @Published var file: URL?
     @Published var sampleSet = SampleSet.pattern
     @Published var sampleHeight = 480
-    func refreshSample() { choose(sampleHeight) }
+    @Published var degraded = false
+    var degradedActive: Bool { degraded && sampleSet != .pattern }
+    var resolutionTiers: [Int] { degradedActive ? [240,360,480] : [360,480,720] }
+    func refreshSample() {
+        choose(resolutionTiers.contains(sampleHeight) ? sampleHeight : 360)
+    }
     let surface = Surface(frame: .zero)
     private var job: Task<Void,Never>?
     var capabilities: String {
         let fg = VTLowLatencyFrameInterpolationConfiguration.isSupported
         let sr = VTLowLatencySuperResolutionScalerConfiguration.isSupported
-        let sizes = [(640,360),(854,480),(1280,720)].map { w,h in
+        let sizes = [(426,240),(640,360),(854,480),(1280,720)].map { w,h in
             let factors = sr ? VTLowLatencySuperResolutionScalerConfiguration.supportedScaleFactors(frameWidth:w,frameHeight:h) : []
             return "\(h)p SR: \(factors.isEmpty ? "none" : factors.map { String($0) }.joined(separator: ", "))"
         }
@@ -280,8 +285,9 @@ struct VideoSurface: UIViewRepresentable {
     }
     func choose(_ height: Int) {
         sampleHeight = height
-        file = Bundle.main.url(forResource:"\(sampleSet.prefix)-\(height)p",withExtension:"mp4")
-        status = file == nil ? "Sample missing" : "Selected \(sampleSet.rawValue) · \(height)p tier / 24fps"
+        let quality = degradedActive ? "low-" : ""
+        file = Bundle.main.url(forResource:"\(sampleSet.prefix)-\(quality)\(height)p",withExtension:"mp4")
+        status = file == nil ? "Sample missing" : "Selected \(sampleSet.rawValue) · \(height)p tier · \(degradedActive ? "compressed" : "clean") / 24fps"
     }
     func chooseSample(_ name: String) {
         file = Bundle.main.url(forResource:"test-\(name)",withExtension:"mp4")
@@ -421,6 +427,7 @@ struct VideoSurface: UIViewRepresentable {
     @State private var importer = false
     @State private var fullScreen = false
     @State private var showControls = true
+    @State private var zoom = 1
 
     var body: some View {
         GeometryReader { geometry in
@@ -440,6 +447,7 @@ struct VideoSurface: UIViewRepresentable {
                     Color.black
                     VideoSurface(surface:lab.surface)
                         .frame(maxWidth:.infinity,maxHeight:.infinity)
+                        .scaleEffect(fullScreen ? CGFloat(zoom) : 1)
                         .contentShape(Rectangle())
                         .onTapGesture {
                             if fullScreen { showControls.toggle() }
@@ -498,6 +506,7 @@ struct VideoSurface: UIViewRepresentable {
             HStack(alignment:.top) {
                 VStack(alignment:.leading,spacing:4) {
                     Text(lab.status).font(.headline)
+                    Text("Center zoom: \(zoom)×").font(.caption)
                     Text(lab.stats).font(.system(.caption,design:.monospaced))
                 }
                 .lineLimit(4)
@@ -507,13 +516,38 @@ struct VideoSurface: UIViewRepresentable {
                 Button {
                     fullScreen = false
                     showControls = true
+                    zoom = 1
                 } label: {
                     Image(systemName:"arrow.down.right.and.arrow.up.left").font(.title2)
                         .padding(12).background(.black.opacity(0.65),in:Circle())
                 }.accessibilityLabel("Exit full screen")
             }
             Spacer(minLength:0)
-            HStack(spacing:24) {
+            HStack(spacing:16) {
+                Menu {
+                    ForEach([1,2,4],id:\.self) { value in
+                        Button {
+                            zoom = value
+                        } label: {
+                            if zoom == value { Label("\(value)×",systemImage:"checkmark") }
+                            else { Text("\(value)×") }
+                        }
+                    }
+                } label: {
+                    Label("\(zoom)×",systemImage:"magnifyingglass")
+                }.accessibilityLabel("Center zoom")
+                Menu {
+                    ForEach(Mode.allCases) { m in
+                        Button {
+                            lab.mode = m
+                        } label: {
+                            if lab.mode == m { Label(m.rawValue,systemImage:"checkmark") }
+                            else { Text(m.rawValue) }
+                        }
+                    }
+                } label: {
+                    Text(lab.mode.rawValue)
+                }.disabled(lab.running)
                 Button {
                     if lab.running { lab.stop() } else { lab.start() }
                 } label: {
@@ -547,7 +581,22 @@ struct VideoSurface: UIViewRepresentable {
                     ForEach(SampleSet.allCases) { Text($0.rawValue).tag($0) }
                 }.pickerStyle(.menu).disabled(lab.running)
                     .onChange(of:lab.sampleSet) { _,_ in lab.refreshSample() }
-                HStack { ForEach([360,480,720],id:\.self) { h in Button("\(h)p") { lab.choose(h) }.buttonStyle(.bordered) }; Button("File") { importer=true }.buttonStyle(.bordered) }.disabled(lab.running)
+                if lab.sampleSet != .pattern {
+                    Picker("Sample quality",selection:$lab.degraded) {
+                        Text("Clean").tag(false)
+                        Text("Low bitrate").tag(true)
+                    }.pickerStyle(.segmented).disabled(lab.running)
+                        .onChange(of:lab.degraded) { _,_ in lab.refreshSample() }
+                    if lab.degradedActive {
+                        Text("Low bitrate: 240p / 360p / 480p, compressed H.264. Same scene as Clean.").font(.caption).foregroundStyle(.secondary)
+                    }
+                }
+                HStack {
+                    ForEach(lab.resolutionTiers,id:\.self) { h in
+                        Button("\(h)p") { lab.choose(h) }.buttonStyle(.bordered)
+                    }
+                    Button("File") { importer=true }.buttonStyle(.bordered)
+                }.disabled(lab.running)
                 if lab.sampleSet == .pattern {
                     HStack { Button("4:3 sample") { lab.chooseSample("4x3") }; Button("21:9 sample") { lab.chooseSample("21x9") } }.buttonStyle(.bordered).disabled(lab.running)
                 } else {

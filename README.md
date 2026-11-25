@@ -15,6 +15,12 @@ Open Actions → Build IPA → successful run → VTPlayer-IPA artifact. Extract
 
 Choose a sample and a mode, press Play. Stop before switching mode. Start with Original, then FG, SR, and FG + SR at each resolution. An unsupported configuration or processing failure is reported explicitly. Submitted FPS does not measure physical display refresh. Late frames are counted, not skipped; overloaded playback can lag. This prototype is silent, lacks seeking and subtitles, and does not handle HDR or rotated video.
 
+## Low-bitrate and zoom comparison
+
+For any animation collection, choose **Low bitrate** for 240p, 360p or 480p tiers. These are derived from the same bundled 720p-tier excerpt, downscaled with bilinear sampling and encoded with H.264 CRF 34 and VBV peak-rate targets of 100, 180 and 300 kb/s respectively. Actual average bitrate may be lower. The original Clean clips are retained. Ultrawide clips fit within the tier bounds without padding. The derivative clips retain the same Creative Commons licenses and credits listed below.
+
+In full screen, tap the picture to show the controls; use the magnifier menu to select 1×, 2× or 4× center zoom. Zoom is a display-only transform, not a new enhancement stage. Stop or finish a clip, switch the processing mode from the full-screen menu, then replay to compare the same scene at the same zoom. Exiting full screen resets zoom to 1×.
+
 ## Animation samples
 
 Select a sample collection, then choose a resolution tier. Each collection uses the same 15-second excerpt at all three resolutions; the source is fitted inside 640×360, 854×480 or 1280×720 without letterbox padding or stretching. HERO is ultrawide, so its actual height is lower than the tier label. All excerpts are silent, resized, converted to 24fps and H.264 for testing. This is not a native-resolution restoration benchmark.
