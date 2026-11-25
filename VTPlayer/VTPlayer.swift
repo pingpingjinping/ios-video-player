@@ -248,7 +248,11 @@ final class Surface: UIView {
 }
 struct VideoSurface: UIViewRepresentable {
     let surface: Surface
-    func makeUIView(context: Context) -> Surface { surface }
+    func makeUIView(context: Context) -> Surface {
+        surface.videoLayer.videoGravity = .resizeAspect
+        surface.backgroundColor = .black
+        return surface
+    }
     func updateUIView(_ uiView: Surface, context: Context) {}
 }
 
@@ -415,11 +419,124 @@ struct VideoSurface: UIViewRepresentable {
 @MainActor struct ContentView: View {
     @StateObject private var lab = Lab()
     @State private var importer = false
+    @State private var fullScreen = false
+    @State private var showControls = true
+
     var body: some View {
+        GeometryReader { geometry in
+            // LiveContainer may keep its host interface locked in portrait.
+            // Rotate the same rendering surface within the window if needed.
+            let rotate = fullScreen && geometry.size.height > geometry.size.width
+            let canvas = rotate
+                ? CGSize(width: geometry.size.height, height: geometry.size.width)
+                : geometry.size
+            VStack(spacing:0) {
+                if !fullScreen {
+                    Text("VTPlayer Lab").font(.largeTitle.bold())
+                        .frame(maxWidth:.infinity,alignment:.leading).padding()
+                }
+                // Keep one UIViewRepresentable mounted across layout transitions.
+                ZStack {
+                    Color.black
+                    VideoSurface(surface:lab.surface)
+                        .frame(maxWidth:.infinity,maxHeight:.infinity)
+                        .contentShape(Rectangle())
+                        .onTapGesture {
+                            if fullScreen { showControls.toggle() }
+                            else { enterFullScreen() }
+                        }
+                    if fullScreen {
+                        if showControls {
+                            fullScreenControls
+                        }
+                    } else {
+                        VStack {
+                            Spacer()
+                            HStack {
+                                Spacer()
+                                Button { enterFullScreen() } label: {
+                                    Image(systemName:"arrow.up.left.and.arrow.down.right")
+                                        .font(.title3)
+                                        .padding(12)
+                                        .background(.black.opacity(0.65),in:Circle())
+                                }.accessibilityLabel("Full screen")
+                            }
+                        }.padding(8).foregroundStyle(.white)
+                    }
+                }
+                .frame(width:canvas.width,height:fullScreen ? canvas.height : min(canvas.width*9/16,canvas.height*0.42))
+                .clipped()
+                if !fullScreen {
+                    settingsPanel
+                }
+            }
+            .frame(width:canvas.width,height:canvas.height)
+            .background {
+                if fullScreen { Color.black }
+            }
+            .rotationEffect(.degrees(rotate ? 90 : 0))
+            .position(x:geometry.size.width/2,y:geometry.size.height/2)
+        }
+        .ignoresSafeArea(.container,edges:fullScreen ? .all : [])
+        .statusBarHidden(fullScreen)
+        .persistentSystemOverlays(fullScreen ? .hidden : .automatic)
+        .fileImporter(isPresented:$importer,allowedContentTypes:[.movie],allowsMultipleSelection:false) { result in
+            switch result {
+            case .success(let urls): lab.file=urls.first; lab.status="File selected"
+            case .failure(let e): lab.status=e.localizedDescription
+            }
+        }
+        .onDisappear { if lab.running { lab.stop() } }
+    }
+
+    private func enterFullScreen() {
+        showControls = true
+        fullScreen = true
+    }
+    private var fullScreenControls: some View {
+        VStack(spacing:8) {
+            HStack(alignment:.top) {
+                VStack(alignment:.leading,spacing:4) {
+                    Text(lab.status).font(.headline)
+                    Text(lab.stats).font(.system(.caption,design:.monospaced))
+                }
+                .lineLimit(4)
+                .padding(10)
+                .background(.black.opacity(0.65),in:RoundedRectangle(cornerRadius:10))
+                Spacer()
+                Button {
+                    fullScreen = false
+                    showControls = true
+                } label: {
+                    Image(systemName:"arrow.down.right.and.arrow.up.left").font(.title2)
+                        .padding(12).background(.black.opacity(0.65),in:Circle())
+                }.accessibilityLabel("Exit full screen")
+            }
+            Spacer(minLength:0)
+            HStack(spacing:24) {
+                Button {
+                    if lab.running { lab.stop() } else { lab.start() }
+                } label: {
+                    Label(lab.running ? "Stop" : "Replay",systemImage:lab.running ? "stop.fill" : "play.fill")
+                }.disabled(lab.file == nil)
+                Button { showControls = false } label: {
+                    Label("Hide",systemImage:"eye.slash")
+                }
+            }
+            .font(.headline)
+            .padding(12)
+            .background(.black.opacity(0.65),in:Capsule())
+        }
+        // Account for the notch on either end of a rotated phone canvas.
+        .padding(.horizontal,52)
+        .padding(.vertical,16)
+        .foregroundStyle(.white)
+        .buttonStyle(.plain)
+    }
+
+    private var settingsPanel: some View {
         ScrollView {
             VStack(alignment:.leading,spacing:14) {
-                Text("VTPlayer Lab").font(.largeTitle.bold())
-                VideoSurface(surface:lab.surface).aspectRatio(16/9,contentMode:.fit).background(.black)
                 Picker("Mode",selection:$lab.mode) { ForEach(Mode.allCases) { Text($0.rawValue).tag($0) } }.pickerStyle(.segmented).disabled(lab.running)
                 if lab.mode.sr {
                     Picker("SR color",selection:$lab.srColorMode) {
@@ -450,11 +567,6 @@ struct VideoSurface: UIViewRepresentable {
                 Text(lab.capabilities).font(.system(.caption,design:.monospaced)).textSelection(.enabled)
                 Text("Experimental silent SDR playback · input ≤720p · SR prefers ≤1080p; 2× diagnostic fallback · submitted FPS is not display FPS.").font(.caption).foregroundStyle(.secondary)
             }.padding()
-        }.fileImporter(isPresented:$importer,allowedContentTypes:[.movie],allowsMultipleSelection:false) { result in
-            switch result {
-            case .success(let urls): lab.file=urls.first; lab.status="File selected"
-            case .failure(let e): lab.status=e.localizedDescription
-            }
-        }.onDisappear { if lab.running { lab.stop() } }
+        }
     }
 }
